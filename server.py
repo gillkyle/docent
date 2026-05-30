@@ -387,7 +387,10 @@ async def upload_art(
 ):
     chunks = []
     total = 0
-    async for chunk in file:
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
         total += len(chunk)
         if total > MAX_UPLOAD_BYTES:
             raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit")
@@ -400,7 +403,12 @@ async def upload_art(
     img = Image.open(io.BytesIO(data))
     w, h = img.size
 
-    if ext not in ("jpg", "png"):
+    # Re-encode to a clean single-frame JPEG unless the source is already a
+    # plain JPEG/PNG. Catches formats the TV rejects even when the filename
+    # says .jpg — e.g. MPO (multi-frame) JPEGs from some cameras/phones.
+    if ext not in ("jpg", "png") or img.format not in ("JPEG", "PNG"):
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=95)
         data = buf.getvalue()
