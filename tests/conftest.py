@@ -26,11 +26,14 @@ def tmp_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "AI_CONFIG_FILE", tmp_path / "ai_config.json")
     monkeypatch.setattr(server, "API_USAGE_FILE", tmp_path / "api_usage.json")
     monkeypatch.setattr(server, "DRIVE_SYNC_FILE", tmp_path / "drive_sync.json")
+    monkeypatch.setattr(server, "APP_SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(server, "TOKEN_FILE", tmp_path / ".tv-token")
 
     monkeypatch.setattr(server, "_art_cache", None)
     monkeypatch.setattr(server, "_current_id_cache", None)
     monkeypatch.setattr(server, "_nws_station_cache", {})
+    monkeypatch.setattr(server, "_playback_task", None)
+    monkeypatch.setattr(server, "_playback_state", {"active": False})
 
     return tmp_path
 

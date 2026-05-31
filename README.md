@@ -6,7 +6,7 @@ Send any image to your Samsung Frame TV with one click.
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Docker](https://img.shields.io/badge/docker-supported-blue?logo=docker)
 
-Docent is a local web app that puts art on your TV. Drop an image in, press **"Display on Frame,"** and it appears on your screen — no Samsung app, no USB drive, no cloud upload. It also manages your full gallery with a museum-quality interface: browse, organize into collections, crop to 16:9, and swap what's showing anytime. Add AI art identification, weather-aware recommendations, and Google Drive import.
+Docent is a local web app that puts art on your TV. Drop an image in, press **"Display on Frame,"** and it appears on your screen — no Samsung app, no USB drive, no cloud upload. It also manages your gallery with a React web UI for browsing, organizing collections, setting mattes, and controlling display-all playback.
 
 <p align="center">
   <img src="assets/images/docent_working.jpeg" alt="A laptop running Docent in front of a Samsung Frame TV displaying the selected artwork" width="700">
@@ -156,7 +156,8 @@ API keys for Claude, OpenAI, and Google Vision are managed through the Settings 
 docent/
   Docent.command     # Double-click launcher with first-run setup wizard
   server.py          # FastAPI backend — TV control, AI pipeline, Drive sync
-  index.html         # Single-page frontend (vanilla HTML/CSS/JS)
+  index.html         # Legacy single-page frontend fallback
+  web/               # Primary React/Vite frontend served from /app and / when built
   assets/            # Logo, fonts, and sample artwork
   tests/             # 73 integration tests, run via pre-commit hook
   pyproject.toml     # Dependencies and project metadata
@@ -202,6 +203,9 @@ uv run python3 server.py
 
 # Run tests
 uv run python3 -m pytest
+
+# Build the React frontend
+cd web && npm run build
 
 # Install with test dependencies
 uv pip install -e ".[test]"

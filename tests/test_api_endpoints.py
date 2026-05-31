@@ -102,6 +102,12 @@ class TestCollections:
         resp = await client.post(f"/api/collections/{cid}/items", json={"content_ids": ["Y", "Z"]})
         assert resp.json()["content_ids"] == ["X", "Y", "Z"]
 
+    async def test_add_items_deduplicates_same_request(self, client):
+        col = (await client.post("/api/collections", json={"name": "Test"})).json()
+        cid = col["id"]
+        resp = await client.post(f"/api/collections/{cid}/items", json={"content_ids": ["X", "X", "Y"]})
+        assert resp.json()["content_ids"] == ["X", "Y"]
+
     async def test_remove_items(self, client):
         col = (await client.post("/api/collections", json={"name": "Test"})).json()
         cid = col["id"]
@@ -120,6 +126,173 @@ class TestCollections:
         assert resp.json()["ok"] is True
         resp = await client.delete(f"/api/collections/{col['id']}")
         assert resp.status_code == 404
+
+
+class TestPlayback:
+    async def test_start_playback_from_content_ids(self, client, mock_tv):
+        resp = await client.post("/api/playback", json={
+            "content_ids": ["A", "B"],
+            "duration": 10,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active"] is True
+        assert data["content_ids"] == ["A", "B"]
+        assert data["matte_id"] == "none"
+        mock_tv.change_matte.assert_called_with("A", "none")
+
+        await client.delete("/api/playback")
+
+    async def test_start_playback_does_not_immediately_advance(self, client, mock_tv):
+        resp = await client.post("/api/playback", json={
+            "content_ids": ["A", "B"],
+            "duration": 10,
+        })
+
+        assert resp.status_code == 200
+        mock_tv.select_image.assert_called_once_with("A", show=True)
+
+        await client.delete("/api/playback")
+
+    async def test_start_playback_from_collection(self, client, mock_tv):
+        col = (await client.post("/api/collections", json={"name": "Morning"})).json()
+        await client.post(f"/api/collections/{col['id']}/items", json={"content_ids": ["A", "B"]})
+
+        resp = await client.post("/api/playback", json={
+            "collection_id": col["id"],
+            "duration": 10,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["content_ids"] == ["A", "B"]
+
+        await client.delete("/api/playback")
+
+    async def test_playback_rejects_short_duration(self, client):
+        resp = await client.post("/api/playback", json={
+            "content_ids": ["A"],
+            "duration": 5,
+        })
+        assert resp.status_code == 400
+
+    async def test_stop_playback(self, client, mock_tv):
+        await client.post("/api/playback", json={
+            "content_ids": ["A"],
+            "duration": 10,
+        })
+        resp = await client.delete("/api/playback")
+        assert resp.json() == {"ok": True, "active": False}
+
+    async def test_start_playback_with_matte(self, client, mock_tv):
+        resp = await client.post("/api/playback", json={
+            "content_ids": ["A"],
+            "duration": 10,
+            "matte_id": "shadowbox_polar",
+        })
+        assert resp.status_code == 200
+        assert resp.json()["matte_id"] == "shadowbox_polar"
+        mock_tv.change_matte.assert_called_with("A", "shadowbox_polar")
+
+        await client.delete("/api/playback")
+
+    async def test_start_playback_continues_when_matte_rejected(self, client, mock_tv):
+        mock_tv.change_matte.side_effect = Exception("error number -7")
+
+        resp = await client.post("/api/playback", json={
+            "content_ids": ["A"],
+            "duration": 10,
+            "matte_id": "none",
+        })
+
+        assert resp.status_code == 200
+        assert resp.json()["warning"]
+        mock_tv.select_image.assert_called_with("A", show=True)
+
+        await client.delete("/api/playback")
+
+    async def test_playback_stops_when_tv_leaves_art_mode(self, mock_tv):
+        mock_tv.get_artmode.return_value = "off"
+
+        await server._run_playback(["B"], duration=10, shuffle=False, matte_id="none")
+
+        mock_tv.select_image.assert_not_called()
+        assert server._playback_state["active"] is False
+        assert server._playback_state["paused_reason"] == "tv_left_art_mode"
+        assert server._playback_state["error"] is None
+
+
+class TestAppSettings:
+    async def test_defaults_to_no_matte(self, client):
+        resp = await client.get("/api/settings")
+        assert resp.status_code == 200
+        assert resp.json()["default_matte_id"] == "none"
+
+    async def test_updates_default_matte(self, client):
+        resp = await client.put("/api/settings", json={"default_matte_id": "shadowbox_polar"})
+        assert resp.status_code == 200
+        assert resp.json()["default_matte_id"] == "shadowbox_polar"
+
+
+class TestMatte:
+    async def test_change_matte_returns_content_and_matte(self, client, mock_tv):
+        resp = await client.post("/api/matte", json={
+            "content_id": "A",
+            "matte_id": "shadowbox_polar",
+        })
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "content_id": "A", "matte_id": "shadowbox_polar"}
+        mock_tv.change_matte.assert_called_with("A", "shadowbox_polar")
+
+    async def test_change_matte_defaults_to_none(self, client, mock_tv):
+        resp = await client.post("/api/matte", json={"content_id": "A", "matte_id": ""})
+
+        assert resp.status_code == 200
+        assert resp.json()["matte_id"] == "none"
+        mock_tv.change_matte.assert_called_with("A", "none")
+
+    async def test_change_matte_batch_best_effort(self, client, mock_tv):
+        def change_matte(content_id, matte_id):
+            if content_id == "B":
+                raise Exception("error number -7")
+
+        mock_tv.change_matte.side_effect = change_matte
+
+        resp = await client.post("/api/matte/batch", json={
+            "content_ids": ["A", "B", "C"],
+            "matte_id": "none",
+        })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["changed"] == ["A", "C"]
+        assert data["failed"][0]["content_id"] == "B"
+
+
+class TestSelect:
+    async def test_select_continues_when_matte_rejected(self, client, mock_tv):
+        mock_tv.change_matte.side_effect = Exception("error number -7")
+
+        resp = await client.post("/api/select", json={"content_id": "A", "matte_id": "none"})
+
+        assert resp.status_code == 200
+        assert resp.json()["warning"]
+        mock_tv.select_image.assert_called_with("A", show=True)
+
+
+class TestArtworkList:
+    async def test_art_list_deduplicates_tv_rows(self, client, mock_tv):
+        mock_tv.available.return_value = [
+            {"content_id": "A", "image_date": "2026:01:01 00:00:00"},
+            {"content_id": "A", "image_date": "2026:01:01 00:00:00"},
+            {"content_id": "B", "image_date": "2026:01:02 00:00:00"},
+        ]
+        mock_tv.get_current.return_value = {"content_id": "A"}
+
+        resp = await client.get("/api/art")
+
+        assert resp.status_code == 200
+        assert [item["content_id"] for item in resp.json()["items"]] == ["A", "B"]
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import socket
 import tempfile
@@ -53,6 +54,7 @@ ARTWORK_META_FILE = DATA_DIR / "artwork_meta.json"
 AI_CONFIG_FILE = DATA_DIR / "ai_config.json"
 API_USAGE_FILE = DATA_DIR / "api_usage.json"
 DRIVE_SYNC_FILE = DATA_DIR / "drive_sync.json"
+APP_SETTINGS_FILE = DATA_DIR / "settings.json"
 
 _LOG_LEVEL_NAME = os.environ.get("DOCENT_LOG_LEVEL", "INFO").upper()
 _LOG_LEVEL = logging.getLevelName(_LOG_LEVEL_NAME)
@@ -71,12 +73,19 @@ _tv_lock = asyncio.Lock()
 _meta_lock = asyncio.Lock()
 _collections_lock = asyncio.Lock()
 _config_lock = asyncio.Lock()
+_settings_lock = asyncio.Lock()
 _usage_lock = asyncio.Lock()
+_playback_task: asyncio.Task | None = None
+_playback_state: dict = {"active": False}
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 _nws_station_cache: dict[str, str] = {}
 
 
 class WeatherUnavailable(Exception):
+    pass
+
+
+class PlaybackInterrupted(Exception):
     pass
 
 
@@ -179,10 +188,28 @@ def _save_thumbnail(content_id: str, data: bytes | bytearray) -> None:
     path.write_bytes(bytes(data))
 
 
+def _save_thumbnail_from_image(content_id: str, img: Image.Image) -> None:
+    thumb = img.copy()
+    thumb.thumbnail((640, 360), Image.LANCZOS)
+    canvas = Image.new("RGB", (640, 360), (245, 244, 239))
+    x = (640 - thumb.width) // 2
+    y = (360 - thumb.height) // 2
+    canvas.paste(thumb.convert("RGB"), (x, y))
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=86)
+    _save_thumbnail(content_id, buf.getvalue())
+
+
 def _get_cached_thumbnail(content_id: str) -> bytes | None:
     path = THUMB_DIR / f"{content_id}.jpg"
     if path.exists():
         return path.read_bytes()
+    original = ORIGINALS_DIR / f"{content_id}.jpg"
+    if original.exists():
+        with Image.open(original) as img:
+            _save_thumbnail_from_image(content_id, img)
+        if path.exists():
+            return path.read_bytes()
     return None
 
 
@@ -196,7 +223,26 @@ def _validate_content_id(cid: str) -> str:
 
 
 def _validate_content_ids(cids: list) -> list[str]:
-    return [_validate_content_id(cid) for cid in cids]
+    seen = set()
+    valid = []
+    for cid in cids:
+        cid = _validate_content_id(cid)
+        if cid not in seen:
+            seen.add(cid)
+            valid.append(cid)
+    return valid
+
+
+def _dedupe_art_items(items: list[dict]) -> list[dict]:
+    seen = set()
+    unique = []
+    for item in items:
+        cid = item.get("content_id")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        unique.append(item)
+    return unique
 
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -264,7 +310,8 @@ def _refresh_art_cache_sync(force: bool = False) -> dict:
         tv = get_tv()
         art = art_connection(tv)
         try:
-            items = art.available()
+            raw_items = art.available()
+            items = _dedupe_art_items(raw_items)
             current = art.get_current()
             current_id = current.get("content_id") if isinstance(current, dict) else None
 
@@ -283,8 +330,8 @@ def _refresh_art_cache_sync(force: bool = False) -> dict:
             _art_cache = items
             _current_id_cache = current_id
             log.info(
-                "Art cache refreshed: %d items, %d new, %d removed",
-                len(items), len(new_ids_set), len(removed_ids),
+                "Art cache refreshed: %d items (%d raw), %d new, %d removed",
+                len(items), len(raw_items), len(new_ids_set), len(removed_ids),
             )
             return {
                 "items": items,
@@ -305,10 +352,125 @@ def _refresh_art_cache_sync(force: bool = False) -> dict:
         raise HTTPException(502, "Cannot reach TV — is it on and connected?")
 
 
+def _load_app_settings() -> dict:
+    defaults = {"default_matte_id": "none"}
+    if APP_SETTINGS_FILE.exists():
+        saved = json.loads(APP_SETTINGS_FILE.read_text())
+        for key, value in defaults.items():
+            saved.setdefault(key, value)
+        return saved
+    return defaults
+
+
+def _save_app_settings(data: dict) -> None:
+    _atomic_write_json(APP_SETTINGS_FILE, data)
+
+
+def _display_matte_from_body(body: dict) -> str:
+    matte_id = body.get("matte_id")
+    if matte_id is None:
+        matte_id = _load_app_settings().get("default_matte_id", "none")
+    matte_id = str(matte_id).strip()
+    return matte_id or "none"
+
+
 def _invalidate_art_cache() -> None:
     global _art_cache, _current_id_cache
     _art_cache = None
     _current_id_cache = None
+
+
+def _is_artmode_active(artmode: object) -> bool:
+    if isinstance(artmode, bool):
+        return artmode
+    if artmode is None:
+        return False
+    return str(artmode).strip().lower() in {"on", "art", "artmode", "art_mode", "true", "1"}
+
+
+async def _select_art_sync(
+    content_id: str,
+    matte_id: str | None = None,
+    require_artmode: bool = False,
+) -> dict:
+    global _current_id_cache
+
+    def _select(art):
+        warning = None
+        if require_artmode:
+            artmode = art.get_artmode()
+            if not _is_artmode_active(artmode):
+                raise PlaybackInterrupted(f"TV left art mode ({artmode or 'unknown'})")
+        if matte_id:
+            try:
+                art.change_matte(content_id, matte_id)
+            except Exception as e:
+                warning = f"TV rejected matte {matte_id}; displayed artwork without changing matte"
+                log.warning("Matte change failed before display: content_id=%s matte_id=%s error=%s", content_id, matte_id, e)
+        art.select_image(content_id, show=True)
+        return {"warning": warning} if warning else {}
+
+    result = await _tv_op(_select)
+    _current_id_cache = content_id
+    return result
+
+
+async def _run_playback(
+    content_ids: list[str],
+    duration: int,
+    shuffle: bool,
+    matte_id: str | None,
+    start_index: int = 0,
+    initial_delay: int = 0,
+) -> None:
+    global _playback_state
+    queue = content_ids[:]
+    index = start_index
+    try:
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+        while True:
+            if shuffle:
+                content_id = random.choice(queue)
+            else:
+                content_id = queue[index % len(queue)]
+                index += 1
+
+            select_result = await _select_art_sync(content_id, matte_id, require_artmode=True)
+            _playback_state = {
+                **_playback_state,
+                "active": True,
+                "current_id": content_id,
+                "started_at": _playback_state.get("started_at"),
+                "warning": select_result.get("warning"),
+            }
+            await asyncio.sleep(duration)
+    except asyncio.CancelledError:
+        raise
+    except PlaybackInterrupted as e:
+        log.info("Display-all playback paused: %s", e)
+        _playback_state = {
+            **_playback_state,
+            "active": False,
+            "paused_reason": "tv_left_art_mode",
+            "error": None,
+            "warning": str(e),
+        }
+    except Exception as e:
+        log.warning("Display-all playback stopped after TV error: %s", e)
+        _playback_state = {**_playback_state, "active": False, "error": str(e)}
+
+
+async def _stop_playback() -> None:
+    global _playback_task, _playback_state
+    if _playback_task and not _playback_task.done():
+        _playback_task.cancel()
+        try:
+            await _playback_task
+        except asyncio.CancelledError:
+            pass
+    _playback_task = None
+    _playback_state = {**_playback_state, "active": False}
 
 
 @asynccontextmanager
@@ -327,6 +489,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Docent", lifespan=lifespan)
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent / "assets"), name="assets")
 
+WEB_DIST_DIR = Path(__file__).parent / "web" / "dist"
+WEB_ASSETS_DIR = WEB_DIST_DIR / "assets"
+if WEB_ASSETS_DIR.exists():
+    app.mount("/app/assets", StaticFiles(directory=WEB_ASSETS_DIR), name="web-assets")
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -343,7 +510,19 @@ async def log_requests(request: Request, call_next):
 
 @app.get("/")
 async def index():
+    app_index = WEB_DIST_DIR / "index.html"
+    if app_index.exists():
+        return FileResponse(app_index)
     return FileResponse(Path(__file__).parent / "index.html")
+
+
+@app.get("/app")
+@app.get("/app/{path:path}")
+async def react_app(path: str = ""):
+    app_index = WEB_DIST_DIR / "index.html"
+    if not app_index.exists():
+        raise HTTPException(404, "React app has not been built yet. Run npm run build in web/.")
+    return FileResponse(app_index)
 
 
 # --- TV info ---
@@ -448,14 +627,71 @@ async def get_thumbnails_batch(body: dict):
 
 @app.post("/api/select")
 async def select_art(body: dict):
-    global _current_id_cache
     content_id = body.get("content_id")
     if not content_id:
         raise HTTPException(400, "content_id required")
     _validate_content_id(content_id)
-    await _tv_op(lambda art: art.select_image(content_id, show=True))
-    _current_id_cache = content_id
-    return {"ok": True, "content_id": content_id}
+    matte_id = _display_matte_from_body(body)
+    await _stop_playback()
+    select_result = await _select_art_sync(content_id, matte_id)
+    return {"ok": True, "content_id": content_id, "matte_id": matte_id, **select_result}
+
+
+@app.get("/api/playback")
+async def get_playback_status():
+    task_done = bool(_playback_task and _playback_task.done())
+    if task_done and _playback_state.get("active"):
+        return {**_playback_state, "active": False}
+    return _playback_state
+
+
+@app.post("/api/playback")
+async def start_playback(body: dict):
+    global _playback_task, _playback_state
+
+    content_ids = body.get("content_ids") or []
+    collection_id = body.get("collection_id")
+    if collection_id:
+        collections = _load_collections().get("collections", [])
+        collection = next((c for c in collections if c["id"] == collection_id), None)
+        if not collection:
+            raise HTTPException(404, "Collection not found")
+        content_ids = collection.get("content_ids", [])
+
+    if not content_ids:
+        raise HTTPException(400, "content_ids or collection_id required")
+
+    content_ids = _validate_content_ids(content_ids)
+    duration = int(body.get("duration", 300))
+    if duration < 10:
+        raise HTTPException(400, "duration must be at least 10 seconds")
+    shuffle = bool(body.get("shuffle", False))
+    matte_id = _display_matte_from_body(body)
+
+    await _stop_playback()
+
+    select_result = await _select_art_sync(content_ids[0], matte_id)
+    _playback_state = {
+        "active": True,
+        "content_ids": content_ids,
+        "duration": duration,
+        "shuffle": shuffle,
+        "matte_id": matte_id,
+        "current_id": content_ids[0],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+        "warning": select_result.get("warning"),
+    }
+    _playback_task = asyncio.create_task(
+        _run_playback(content_ids, duration, shuffle, matte_id, start_index=1, initial_delay=duration)
+    )
+    return _playback_state
+
+
+@app.delete("/api/playback")
+async def stop_playback():
+    await _stop_playback()
+    return {"ok": True, "active": False}
 
 
 # --- Upload ---
@@ -463,7 +699,7 @@ async def select_art(body: dict):
 @app.post("/api/upload")
 async def upload_art(
     file: UploadFile = File(...),
-    matte: str = Form("shadowbox_polar"),
+    matte: str = Form(""),
     filename: str = Form(""),
     analyze: bool = Query(False),
 ):
@@ -500,6 +736,7 @@ async def upload_art(
         ext = "jpg"
 
     original_name = filename.strip() or Path(file.filename or "image.jpg").stem
+    matte = matte.strip() or _load_app_settings().get("default_matte_id", "none")
 
     # Push to the TV off the event loop so this (often slow) call doesn't
     # freeze the rest of the app.
@@ -515,6 +752,7 @@ async def upload_art(
     buf = io.BytesIO()
     analysis_img.save(buf, format="JPEG", quality=80)
     (ORIGINALS_DIR / f"{content_id}.jpg").write_bytes(buf.getvalue())
+    _save_thumbnail_from_image(content_id, img)
 
     async with _meta_lock:
         meta = _load_artwork_meta()
@@ -566,7 +804,7 @@ async def delete_art(body: dict):
     content_ids = body.get("content_ids", [])
     if not content_ids:
         raise HTTPException(400, "content_ids required")
-    _validate_content_ids(content_ids)
+    content_ids = _validate_content_ids(content_ids)
     ok = await _tv_op(lambda art: art.delete_list(content_ids))
     for cid in content_ids:
         (THUMB_DIR / f"{cid}.jpg").unlink(missing_ok=True)
@@ -596,13 +834,57 @@ async def change_matte(body: dict):
     if not content_id:
         raise HTTPException(400, "content_id required")
     _validate_content_id(content_id)
-    log.info("Changing matte: content_id=%s, matte_id=%s", content_id, matte_id)
+    matte_id = str(matte_id).strip() or "none"
     try:
+        log.info("Changing matte: content_id=%s, matte_id=%s", content_id, matte_id)
         await _tv_op(lambda art: art.change_matte(content_id, matte_id))
-        return {"ok": True}
+        if _art_cache is not None:
+            for item in _art_cache:
+                if item.get("content_id") == content_id:
+                    item["matte_id"] = matte_id
+        return {"ok": True, "content_id": content_id, "matte_id": matte_id}
     except Exception as e:
         if "error number" in str(e):
             raise HTTPException(422, "TV rejected matte change — this image may not support that matte style")
+        raise HTTPException(502, "Cannot reach TV")
+
+
+@app.post("/api/matte/batch")
+async def change_matte_batch(body: dict):
+    content_ids = body.get("content_ids", [])
+    if not content_ids:
+        raise HTTPException(400, "content_ids required")
+    content_ids = _validate_content_ids(content_ids)
+    matte_id = str(body.get("matte_id", "none")).strip() or "none"
+
+    changed = []
+    failed = []
+
+    def _change_batch(art):
+        for content_id in content_ids:
+            try:
+                log.info("Changing matte: content_id=%s, matte_id=%s", content_id, matte_id)
+                art.change_matte(content_id, matte_id)
+                changed.append(content_id)
+            except Exception as e:
+                failed.append({"content_id": content_id, "error": str(e)})
+        return changed, failed
+
+    try:
+        await _tv_op(_change_batch)
+        if _art_cache is not None and changed:
+            changed_set = set(changed)
+            for item in _art_cache:
+                if item.get("content_id") in changed_set:
+                    item["matte_id"] = matte_id
+
+        return {
+            "ok": not failed,
+            "matte_id": matte_id,
+            "changed": changed,
+            "failed": failed,
+        }
+    except Exception:
         raise HTTPException(502, "Cannot reach TV")
 
 
@@ -680,11 +962,32 @@ async def set_slideshow(body: dict):
         raise HTTPException(502, "Cannot reach TV")
 
 
+# --- App settings ---
+
+@app.get("/api/settings")
+async def get_app_settings():
+    return _load_app_settings()
+
+
+@app.put("/api/settings")
+async def update_app_settings(body: dict):
+    async with _settings_lock:
+        settings = _load_app_settings()
+        if "default_matte_id" in body:
+            matte_id = str(body["default_matte_id"]).strip()
+            settings["default_matte_id"] = matte_id or "none"
+        _save_app_settings(settings)
+    return settings
+
+
 # --- Collections ---
 
 def _load_collections() -> dict:
     if COLLECTIONS_FILE.exists():
-        return json.loads(COLLECTIONS_FILE.read_text())
+        data = json.loads(COLLECTIONS_FILE.read_text())
+        for collection in data.get("collections", []):
+            collection["content_ids"] = _validate_content_ids(collection.get("content_ids", []))
+        return data
     return {"collections": []}
 
 
@@ -708,6 +1011,8 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 
 def _save_collections(data: dict) -> None:
+    for collection in data.get("collections", []):
+        collection["content_ids"] = _validate_content_ids(collection.get("content_ids", []))
     _atomic_write_json(COLLECTIONS_FILE, data)
 
 
@@ -762,7 +1067,7 @@ async def add_to_collection(collection_id: str, body: dict):
     content_ids = body.get("content_ids", [])
     if not content_ids:
         raise HTTPException(400, "content_ids required")
-    _validate_content_ids(content_ids)
+    content_ids = _validate_content_ids(content_ids)
     async with _collections_lock:
         data = _load_collections()
         for c in data["collections"]:
@@ -1590,7 +1895,7 @@ async def run_drive_sync(sync_id: str):
                     w, h = img.size
                     ext = "jpg"
 
-                matte = "shadowbox_polar"
+                matte = _load_app_settings().get("default_matte_id", "none")
                 content_id = await _tv_op(
                     lambda art: art.upload(image_data, matte=matte, file_type=ext),
                     attempts=1, timeout=120,

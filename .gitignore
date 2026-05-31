@@ -15,6 +15,7 @@ api_usage.json
 drive_sync.json
 artwork_meta.json
 collections.json
+settings.json
 
 # Environment config
 .env
